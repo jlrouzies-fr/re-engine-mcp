@@ -287,6 +287,38 @@ class REFrameworkWebAPI {
         try { return via.gui.message.get(guid)?.ToString(); } catch { return null; }
     }
 
+    // Build a game-side System.Guid value type from a GUID string. Not every game's TDB
+    // exposes Guid.Parse (DD2 doesn't), so write the components into a fresh value type.
+    // RE Engine GUID fields: mData1 (uint), mData2 (ushort), mData3 (ushort), mData4_0..mData4_7 (bytes)
+    static IObject MakeGameGuid(string guidStr) {
+        if (!Guid.TryParse(guidStr, out var parsedGuid)) return null;
+        var guidTdef = TDB.Get().GetType("System.Guid");
+        if (guidTdef == null) return null;
+        var guidVt = guidTdef.CreateValueType();
+        var bytes = parsedGuid.ToByteArray();
+        var guidFields = new Dictionary<string, Field>();
+        for (var p = guidTdef; p != null; p = p.ParentType)
+            foreach (var f in p.GetFields())
+                if (!f.IsStatic()) guidFields.TryAdd(f.GetName(), f);
+        if (guidFields.TryGetValue("mData1", out var fd1)) fd1.SetDataBoxed(guidVt.GetAddress(), BitConverter.ToUInt32(bytes, 0), true);
+        if (guidFields.TryGetValue("mData2", out var fd2)) fd2.SetDataBoxed(guidVt.GetAddress(), BitConverter.ToUInt16(bytes, 4), true);
+        if (guidFields.TryGetValue("mData3", out var fd3)) fd3.SetDataBoxed(guidVt.GetAddress(), BitConverter.ToUInt16(bytes, 6), true);
+        for (int gi = 0; gi < 8; gi++) {
+            if (guidFields.TryGetValue($"mData4_{gi}", out var fdi))
+                fdi.SetDataBoxed(guidVt.GetAddress(), bytes[8 + gi], true);
+        }
+        return guidVt;
+    }
+
+    // Localize a GUID string through via.gui.message.get(System.Guid), resolved via the TDB
+    // so it works regardless of what the generated _System.Guid wrapper exposes.
+    static string ResolveGuid(string guidStr) {
+        var guidVt = MakeGameGuid(guidStr);
+        if (guidVt == null) return null;
+        var getMethod = TDB.Get().FindType("via.gui.message")?.FindMethod("get(System.Guid)");
+        return getMethod?.InvokeBoxed(typeof(string), null, new object[] { guidVt }) as string;
+    }
+
 #if MHWILDS
     static object GetEquipment() {
         try {
@@ -942,7 +974,7 @@ class REFrameworkWebAPI {
             // Support comma-separated GUIDs for batch resolution
             var guids = guidStr.Split(',');
             if (guids.Length == 1) {
-                var text = via.gui.message.get(_System.Guid.Parse(guidStr.Trim()))?.ToString();
+                var text = ResolveGuid(guidStr.Trim());
                 return new { guid = guidStr, text = text ?? "" };
             }
 
@@ -950,7 +982,7 @@ class REFrameworkWebAPI {
             foreach (var g in guids) {
                 var trimmed = g.Trim();
                 try {
-                    var text = via.gui.message.get(_System.Guid.Parse(trimmed))?.ToString();
+                    var text = ResolveGuid(trimmed);
                     results.Add(new { guid = trimmed, text = text ?? "" });
                 } catch {
                     results.Add(new { guid = trimmed, text = "", error = "Failed to parse" });
@@ -1773,24 +1805,8 @@ class REFrameworkWebAPI {
                 return value.GetString();
             case "System.Guid":
                 // Accept GUID as string "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                if (value.ValueKind == JsonValueKind.String && Guid.TryParse(value.GetString(), out var parsedGuid)) {
-                    var guidTdef = TDB.Get().GetType("System.Guid");
-                    if (guidTdef == null) return null;
-                    var guidVt = guidTdef.CreateValueType();
-                    // RE Engine GUID fields: mData1 (uint), mData2 (ushort), mData3 (ushort), mData4_0..mData4_7 (bytes)
-                    var bytes = parsedGuid.ToByteArray();
-                    var guidFields = new Dictionary<string, Field>();
-                    for (var p = guidTdef; p != null; p = p.ParentType)
-                        foreach (var f in p.GetFields())
-                            if (!f.IsStatic()) guidFields.TryAdd(f.GetName(), f);
-                    if (guidFields.TryGetValue("mData1", out var fd1)) fd1.SetDataBoxed(guidVt.GetAddress(), BitConverter.ToUInt32(bytes, 0), true);
-                    if (guidFields.TryGetValue("mData2", out var fd2)) fd2.SetDataBoxed(guidVt.GetAddress(), BitConverter.ToUInt16(bytes, 4), true);
-                    if (guidFields.TryGetValue("mData3", out var fd3)) fd3.SetDataBoxed(guidVt.GetAddress(), BitConverter.ToUInt16(bytes, 6), true);
-                    for (int gi = 0; gi < 8; gi++) {
-                        if (guidFields.TryGetValue($"mData4_{gi}", out var fdi))
-                            fdi.SetDataBoxed(guidVt.GetAddress(), bytes[8 + gi], true);
-                    }
-                    return guidVt;
+                if (value.ValueKind == JsonValueKind.String) {
+                    return MakeGameGuid(value.GetString());
                 }
                 return null;
             default:
